@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>档案识读 · 本地档案管理与文字识别</title>
+<link rel="stylesheet" href="styles.css">
+<!-- 本地内置库（离线可用）；若本地缺失则回退到 CDN -->
+<script src="vendor/tesseract/tesseract.min.js"></script>
+<script>window.Tesseract||document.write('<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"><\/script>')</script>
+<script src="vendor/jszip.min.js"></script>
+<script>window.JSZip||document.write('<script src="https://cdn.jsdelivr.net/npm/jszip@3/dist/jszip.min.js"><\/script>')</script>
+<script src="vendor/pako_inflate.min.js"></script>
+<script src="vendor/UTIF.js"></script>
+<script>window.UTIF||document.write('<script src="https://cdn.jsdelivr.net/npm/utif2@4/UTIF.js"><\/script>')</script>
+<script src="vendor/heic2any.min.js"></script>
+<script>window.heic2any||document.write('<script src="https://cdn.jsdelivr.net/npm/heic2any@0.0.4/dist/heic2any.min.js"><\/script>')</script>
+<script src="vendor/mammoth.browser.min.js"></script>
+<script>window.mammoth||document.write('<script src="https://cdn.jsdelivr.net/npm/mammoth@1/mammoth.browser.min.js"><\/script>')</script>
+<script src="vendor/xlsx.full.min.js"></script>
+<script>window.XLSX||document.write('<script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"><\/script>')</script>
+</head>
+<body>
+<header class="masthead">
+  <a class="brand" href="#/library">
+    <span class="seal" aria-hidden="true">档</span>
+    <span><strong>档案识读</strong><small>本地档案整理 · 文字识别 · 年表 · 主题</small></span>
+  </a>
+  <nav class="tabs" id="tabs">
+    <a href="#/import" data-view="import">导入</a>
+    <a href="#/library" data-view="library">档案库</a>
+    <a href="#/search" data-view="search">检索</a>
+    <a href="#/timeline" data-view="timeline">年表</a>
+    <a href="#/themes" data-view="themes">主题</a>
+    <a href="#/notes" data-view="notes">笔记</a>
+    <a href="#/settings" data-view="settings">设置</a>
+  </nav>
+  <div class="privacy" title="所有处理均在本机浏览器内完成，文件不会上传"><span class="dot"></span>仅在本机处理</div>
+</header>
+<div id="globalProgress" class="global-progress" hidden><div class="bar"><span></span></div><small></small></div>
+
+<main id="app">
+<!-- 导入 -->
+<section class="view" id="view-import" hidden>
+  <div class="grid-import">
+    <div class="card">
+      <h2>图像与 PDF <small>自动识别文字</small></h2>
+      <label class="dropzone" id="dropVisual" tabindex="0">
+        <input type="file" id="inVisual" multiple accept=".jpg,.jpeg,.jfif,.png,.tif,.tiff,.webp,.bmp,.gif,.heic,.heif,.pdf,image/*,application/pdf" hidden>
+        <strong>拖放图像或 PDF 到此处</strong><span>或点击选择（可多选）</span>
+        <small>JPG · PNG · TIFF（多页）· WEBP · BMP · GIF · HEIC/HEIF · PDF（多页）</small>
+      </label>
+      <div class="btnrow"><button id="pickFolder" class="ghost">选择整个文件夹…</button><input type="file" id="inFolder" webkitdirectory directory multiple hidden></div>
+    </div>
+    <div class="card">
+      <h2>文档与表格 <small>直接提取文字</small></h2>
+      <label class="dropzone alt" id="dropDocs" tabindex="0">
+        <input type="file" id="inDocs" multiple accept=".docx,.doc,.xlsx,.xls,.csv,.txt,.md,.odt,.ods" hidden>
+        <strong>拖放 Word / Excel 文件到此处</strong><span>或点击选择</span>
+        <small>.docx · .doc（实验性）· .xlsx · .xls · .csv · .txt</small>
+      </label>
+      <label class="field">本批次标签 <input id="batchTags" placeholder="例如：北平档案, 1937, 教育（逗号分隔）"></label>
+    </div>
+    <div class="card settings-card">
+      <h2>识别设置 <small>针对印刷体优化</small></h2>
+      <fieldset><legend>识别语言（可多选）</legend><div id="langChips" class="chips"></div></fieldset>
+      <label class="toggle"><input type="checkbox" id="optVertical"> 竖排中文（直行，自右向左）<small class="muted">使用 chi_sim_vert / chi_tra_vert 模型</small></label>
+      <div class="two">
+        <label class="field">版面
+          <select id="optPsm">
+            <option value="3">自动分析版面（推荐）</option>
+            <option value="4">单栏文字</option>
+            <option value="6">单一文本块</option>
+            <option value="5">竖排单一文本块</option>
+            <option value="11">零散文字</option>
+            <option value="1">自动 + 方向检测</option>
+          </select>
+        </label>
+        <label class="field">并行识别数
+          <select id="optPool"><option>1</option><option>2</option><option>3</option><option>4</option></select>
+        </label>
+      </div>
+      <fieldset><legend>图像预处理（适用于褪色扫描件）</legend>
+        <label class="toggle"><input type="checkbox" id="optGray"> 灰度</label>
+        <label class="toggle"><input type="checkbox" id="optUpscale"> 小图自动放大</label>
+        <label class="toggle"><input type="checkbox" id="optContrast"> 增强对比度（自动色阶）</label>
+        <label class="toggle"><input type="checkbox" id="optThreshold"> 黑白二值化（Otsu）</label>
+        <label class="toggle"><input type="checkbox" id="optInvert"> 反色（深底浅字）</label>
+      </fieldset>
+      <div class="two">
+        <label class="field">PDF 渲染精度
+          <select id="optScale"><option value="1.5">快速 (108 dpi)</option><option value="2.5">标准 (180 dpi)</option><option value="4">高 (288 dpi)</option></select>
+        </label>
+        <label class="toggle"><input type="checkbox" id="optPdfText"> PDF 自带文字层时直接提取</label>
+      </div>
+    </div>
+  </div>
+  <div class="card">
+    <div class="card-head"><h2>处理队列</h2><span id="queueSummary" class="muted small"></span></div>
+    <ul id="queueList" class="queue"><li class="empty">尚无任务。导入文件后会自动排队识别。</li></ul>
+  </div>
+</section>
+
+<!-- 档案库 -->
+<section class="view" id="view-library" hidden>
+  <div class="toolbar">
+    <input id="libFilter" type="search" placeholder="筛选标题、文字、标签…">
+    <select id="libType"></select>
+    <select id="libTag"></select>
+    <select id="libSort"><option value="new">最新导入</option><option value="title">按标题</option><option value="date">按档案日期</option></select>
+    <div class="seg"><button data-mode="grid" class="on">网格</button><button data-mode="list">列表</button></div>
+    <a class="button primary" href="#/import">＋ 导入</a>
+  </div>
+  <div class="card-head"><p id="libCount" class="muted small"></p><span class="export-row" id="libExport"><span class="muted small">导出当前列表文字：</span><button class="ghost small" data-lexp="txt">合并 .txt</button><button class="ghost small" data-lexp="zip">.zip（每件一个 .txt）</button><button class="ghost small" data-lexp="json">JSON（逐页）</button><button class="ghost small" data-lexp="docx">.docx</button></span></div>
+  <div id="libItems" class="lib grid"></div>
+</section>
+
+<!-- 条目详情 -->
+<section class="view" id="view-item" hidden></section>
+
+<!-- 检索 -->
+<section class="view" id="view-search" hidden>
+  <div class="card">
+    <div class="searchbar"><input id="q" type="search" placeholder="输入关键词，多个关键词用空格分隔（同时包含）；短语可加引号"><button id="qBtn" class="primary">检索</button></div>
+    <div class="filters">
+      <label>类型 <select id="sType"></select></label>
+      <label>标签 <select id="sTag"></select></label>
+      <label>日期从 <input id="sFrom" placeholder="1930 或 1937-07"></label>
+      <label>至 <input id="sTo" placeholder="1945-12-31"></label>
+      <label class="toggle"><input type="checkbox" id="sNotes" checked> 包含笔记</label>
+    </div>
+  </div>
+  <div class="card-head"><p id="sCount" class="muted"></p><span class="export-row" data-export="search"></span></div>
+  <div id="sResults" class="results"></div>
+</section>
+
+<!-- 年表 -->
+<section class="view" id="view-timeline" hidden>
+  <div class="toolbar">
+    <input id="tlFilter" type="search" placeholder="筛选年表…">
+    <label class="small">从 <input id="tlFrom" size="8" placeholder="1900"></label>
+    <label class="small">至 <input id="tlTo" size="8" placeholder="1949"></label>
+    <button id="tlAdd" class="primary">＋ 手动添加</button>
+    <button id="tlRescan" class="ghost" title="从所有条目重新提取日期（保留手动编辑）">重新提取</button>
+    <button id="tlAI" class="ghost ai-only">AI 年表总结</button>
+    <span class="export-row" data-export="timeline"></span>
+  </div>
+  <div id="tlAIBox" class="ai-box" hidden></div>
+  <div id="tlList" class="timeline"></div>
+</section>
+
+<!-- 主题 -->
+<section class="view" id="view-themes" hidden>
+  <div class="toolbar">
+    <button id="thRun" class="primary">重新分析主题</button>
+    <label class="small">聚类阈值（越低越易合并） <input id="thThreshold" type="range" min="0.03" max="0.35" step="0.01" value="0.06"></label>
+    <button id="thAI" class="ghost ai-only">AI 总结各主题</button>
+    <span class="export-row" data-export="themes"></span>
+  </div>
+  <p class="muted small">本地分析：中文按字二元组（bigram）+ 停用词过滤计算 TF-IDF，再按相似度聚类；英文按词。结果为辅助线索，请结合原文判断。</p>
+  <div id="thList" class="themes"></div>
+  <h2 class="section-title">按标签</h2>
+  <div id="tagThemes" class="themes tags"></div>
+</section>
+
+<!-- 笔记 -->
+<section class="view" id="view-notes" hidden>
+  <div class="notes-layout">
+    <aside class="card notes-side">
+      <div class="btnrow"><button id="noteNew" class="primary">＋ 新建笔记</button></div>
+      <input id="noteFilter" type="search" placeholder="搜索笔记…">
+      <ul id="noteList" class="notelist"></ul>
+    </aside>
+    <div class="card" id="noteEditor"></div>
+  </div>
+</section>
+
+<!-- 设置 -->
+<section class="view" id="view-settings" hidden>
+  <div class="grid-two">
+    <div class="card">
+      <h2>AI 总结（可选）</h2>
+      <p class="muted small">填写任一 OpenAI 兼容接口（如 OpenAI、DeepSeek、通义千问兼容模式、本地 Ollama / LM Studio）。密钥只保存在本浏览器的 localStorage，不写入档案备份。<b>注意：使用 AI 时，所选文字会发送到该接口。</b>不填写也可使用全部本地功能。</p>
+      <label class="field">接口地址 <input id="aiEndpoint" placeholder="https://api.openai.com/v1 或 http://localhost:11434/v1"></label>
+      <label class="field">API Key <input id="aiKey" type="password" placeholder="sk-…（本地模型可留空）" autocomplete="off"></label>
+      <label class="field">模型 <input id="aiModel" placeholder="gpt-4o-mini / deepseek-chat / qwen2.5"></label>
+      <div class="btnrow"><button id="aiSave" class="primary">保存</button><button id="aiTest" class="ghost">测试连接</button><button id="aiClear" class="ghost">清除</button></div>
+      <p id="aiStatus" class="muted small"></p>
+    </div>
+    <div class="card">
+      <h2>备份与恢复</h2>
+      <p class="muted small">完整备份包含全部条目（含图像）、笔记、年表与 AI 总结，为单个 JSON 文件。</p>
+      <div class="btnrow wrap"><button id="backupBtn" class="primary">导出完整备份 (.json)</button><button id="restoreBtn" class="ghost">导入备份…</button><input type="file" id="restoreIn" accept=".json,application/json" hidden></div>
+      <h2>存储</h2>
+      <p id="storageInfo" class="muted small"></p>
+      <div class="btnrow"><button id="persistBtn" class="ghost">申请持久存储</button><button id="wipeBtn" class="danger">清空全部数据</button></div>
+      <h2>关于</h2>
+      <p class="muted small">基于 Tesseract.js（LSTM 引擎）、pdf.js、mammoth.js、SheetJS、heic2any。所有档案数据保存在本浏览器的 IndexedDB 中；更换浏览器或清除站点数据前请先导出备份。</p>
+    </div>
+  </div>
+</section>
+</main>
+
+<div id="selPop" class="selpop" hidden>
+  <select id="selNote"></select><button id="selAdd" class="primary">引用到笔记</button>
+</div>
+<div id="toast" class="toast" role="status" aria-live="polite"></div>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
