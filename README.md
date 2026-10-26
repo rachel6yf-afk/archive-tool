@@ -1,6 +1,6 @@
 # 档案识读 · Archive OCR
 
-A local archive manager for historians that runs entirely in your browser: OCR, document text extraction, a searchable library, notes, a chronology (年表) and theme summaries (主题). Your files and data stay on your computer (stored in the browser's IndexedDB). All libraries and language models are bundled in `vendor/`, so it works offline.
+A local archive manager for historians that runs entirely in your browser: OCR, document text extraction, a searchable library, notes, a chronology (年表) and theme summaries (主题). Your files and data stay on your computer (stored in the browser's IndexedDB). All libraries and language models are bundled in `vendor/`, so it works offline. Optionally, Google Gemini can be used as a more accurate cloud OCR engine (see 「Gemini 云端识别」 below).
 
 ## How to run
 ```bash
@@ -22,8 +22,37 @@ You have to open it through a local server. Opening `index.html` directly with `
 - **AI (optional)**: in 设置 (Settings), enter any OpenAI-compatible endpoint, key and model (OpenAI, DeepSeek, Qwen, or local Ollama/LM Studio) to get summaries per item, per theme and for the timeline. The key is kept only in localStorage and is never included in backups. Everything else works without it.
 - **备份 Backup**: export the whole archive as one JSON file (items with images, notes, timeline, AI summaries) and import it again in any browser.
 
+## Gemini 云端识别（可选，推荐用于印刷档案）
+
+**设置步骤**
+1. 打开 <https://aistudio.google.com/apikey>，用 Google 账号登录，点击“Create API key”生成密钥（免费层即可使用，有每日次数限制）。
+2. 在本工具 **设置 → Gemini 云端识别** 中粘贴 API Key，点击 **保存**，再点 **测试连接**，看到“✓ 连接成功”即可。
+3. 模型默认 `gemini-3.8-flash`（速度快、成本低）。点 **获取可用模型** 可列出您的密钥能用的全部模型；也可选“其他模型（手动填写）”输入任意模型名。并发数默认 2。
+
+**默认行为**
+- 已保存 Gemini 密钥时，新导入的材料**默认使用 Gemini** 识别；未保存密钥时使用本地 Tesseract，并在导入页提示可在设置中添加密钥。
+- 在导入页 **识别引擎** 中手动选择“Tesseract（本地，离线）”或“Gemini（云端，更准确）”后，该选择会被记住（localStorage），优先于上述默认。
+- **Gemini 失败时自动改用 Tesseract** 默认开启：网络错误、配额用尽、服务繁忙等情况下，该页自动用 Tesseract 识别并在页面上注明原因。
+- 若所选模型已被 Google 停用（404），工具会通过 ListModels 自动改用当前最新的 Flash 模型并提示。
+
+**重新识别**
+- 条目详情页：“Gemini 重识别本页”或用 Tesseract 重识别本页；多页条目可点“全部页用 Gemini 识别”。
+- 档案库：点“多选”，勾选若干条目后点“用 Gemini 重新识别所选”。已手动修改过的页面会先询问是否覆盖。
+- Gemini 识别的页面显示“引擎：Gemini”徽标（不提供置信度），每页记录所用引擎和模型，JSON 导出中也包含这两项。
+
+**识别提示词**：要求逐字忠实转录——不做繁简转换、不改正错字、竖排按从右到左逐列阅读、保留分段、无法辨认的字用 □ 表示、印章/批注等用【印】【批注】标出、只输出正文不加说明。
+
+**AI 摘要**：设置 → AI 中“服务商”可选 **Gemini**，复用同一密钥生成条目摘要、主题摘要和年表总结。
+
+**隐私与注意事项**
+- 使用 Gemini 时，页面图像（压缩为 JPEG）会发送到 Google 服务器识别；Tesseract 则完全在本机运行。涉及敏感或未公开档案时请慎用，或改用 Tesseract。免费层数据可能被 Google 用于改进产品，详见 Google 条款。
+- 密钥只保存在本浏览器的 localStorage 中，**不会写入备份文件**；点“清除密钥”即可删除。
+- 需要能访问 `generativelanguage.googleapis.com`；部分地区（如中国大陆）需要相应的网络环境，否则会显示网络错误并（若开启）自动改用 Tesseract。
+- 免费层有每分钟和每日请求上限；服务繁忙（503）时最多重试 2 次，速率限制（429）按 Google 建议的时间重试，每日配额用尽则不再重试。每次重试都计入配额。
+- 极少数情况下 Gemini 可能因安全策略或“背诵”（RECITATION，如与已出版文本高度一致）拒绝输出，此时会显示原因并可改用 Tesseract。
+
 ## Tests
-`tests/gen.py` generates the sample files (in `tests/samples/`). `tests/e2e.mjs` is a Playwright end-to-end test (headless Chrome). It blocks every request that isn't to localhost, which confirms that no network access is needed.
+`tests/gen.py` generates the sample files (in `tests/samples/`). `tests/e2e.mjs` is a Playwright end-to-end test (headless Chrome). It blocks every request that isn't to localhost, which confirms that no network access is needed. `tests/e2e-gemini.mjs` tests the Gemini integration against a mocked API (request shape, concurrency, retries, errors, fallback, model auto-switch, summaries, no key in backups). `tests/live-gemini.mjs` is an optional live test that reads a real key from a local file you supply.
 
 ## Limitations
 - Tesseract handles clean printed text well (88–92% confidence on the test scans). It does poorly on handwriting, ornate or very degraded type, dense classical layouts, seals and marginal notes. Vertical text recognition is weaker than horizontal. Mixing chi_sim and chi_tra on one page can produce mixed character forms, so pick the one that matches the document.

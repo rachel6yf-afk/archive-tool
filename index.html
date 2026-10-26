@@ -35,7 +35,7 @@
     <a href="#/notes" data-view="notes">笔记</a>
     <a href="#/settings" data-view="settings">设置</a>
   </nav>
-  <div class="privacy" title="所有处理均在本机浏览器内完成，文件不会上传"><span class="dot"></span>仅在本机处理</div>
+  <div class="privacy" id="privacy" title="所有处理均在本机浏览器内完成，文件不会上传"><span class="dot"></span><span id="privacyText">仅在本机处理</span></div>
 </header>
 <div id="globalProgress" class="global-progress" hidden><div class="bar"><span></span></div><small></small></div>
 
@@ -63,8 +63,16 @@
     </div>
     <div class="card settings-card">
       <h2>识别设置 <small>针对印刷体优化</small></h2>
+      <fieldset class="engine-pick"><legend>识别引擎</legend>
+        <label class="engine-opt"><input type="radio" name="engine" value="tesseract" id="engTess"><span><b>Tesseract（本地，离线）</b><small>完全在本机运行，文件不会离开电脑。未设置 Gemini 密钥时默认使用。</small></span></label>
+        <label class="engine-opt"><input type="radio" name="engine" value="gemini" id="engGem"><span><b>Gemini（云端，更准确）</b><small>设置密钥后默认使用。页面图像发送至 Google 识别，需要网络。</small></span></label>
+      </fieldset>
+      <div id="engNote" class="engine-note small" hidden></div>
+      <label class="toggle gem-only"><input type="checkbox" id="optFallback"> Gemini 识别失败时自动改用 Tesseract（本地）</label>
       <fieldset><legend>识别语言（可多选）</legend><div id="langChips" class="chips"></div></fieldset>
       <label class="toggle"><input type="checkbox" id="optVertical"> 竖排中文（直行，自右向左）<small class="muted">使用 chi_sim_vert / chi_tra_vert 模型</small></label>
+      <div class="tess-opts">
+      <p class="muted small gem-only">以下版面与预处理选项用于 Tesseract（含 Gemini 失败时的回退）；语言与竖排设置也会作为提示提供给 Gemini。</p>
       <div class="two">
         <label class="field">版面
           <select id="optPsm">
@@ -87,6 +95,7 @@
         <label class="toggle"><input type="checkbox" id="optThreshold"> 黑白二值化（Otsu）</label>
         <label class="toggle"><input type="checkbox" id="optInvert"> 反色（深底浅字）</label>
       </fieldset>
+      </div>
       <div class="two">
         <label class="field">PDF 渲染精度
           <select id="optScale"><option value="1.5">快速 (108 dpi)</option><option value="2.5">标准 (180 dpi)</option><option value="4">高 (288 dpi)</option></select>
@@ -109,9 +118,16 @@
     <select id="libTag"></select>
     <select id="libSort"><option value="new">最新导入</option><option value="title">按标题</option><option value="date">按档案日期</option></select>
     <div class="seg"><button data-mode="grid" class="on">网格</button><button data-mode="list">列表</button></div>
+    <button id="libSelect" class="ghost" title="选择多个条目，批量重新识别">选择…</button>
     <a class="button primary" href="#/import">＋ 导入</a>
   </div>
   <div class="card-head"><p id="libCount" class="muted small"></p><span class="export-row" id="libExport"><span class="muted small">导出当前列表文字：</span><button class="ghost small" data-lexp="txt">合并 .txt</button><button class="ghost small" data-lexp="zip">.zip（每件一个 .txt）</button><button class="ghost small" data-lexp="json">JSON（逐页）</button><button class="ghost small" data-lexp="docx">.docx</button></span></div>
+  <div id="libSelBar" class="selbar" hidden>
+    <span>已选 <b id="libSelN">0</b> 个条目</span>
+    <button class="ghost small" id="libSelAll">全选当前列表</button><button class="ghost small" id="libSelNone">清除选择</button>
+    <span class="spacer"></span>
+    <button class="primary small" id="libReGem">用 Gemini 重新识别所选</button><button class="ghost small" id="libReTess">用 Tesseract 重新识别所选</button><button class="ghost small" id="libSelDone">完成</button>
+  </div>
   <div id="libItems" class="lib grid"></div>
 </section>
 
@@ -178,15 +194,37 @@
 <!-- 设置 -->
 <section class="view" id="view-settings" hidden>
   <div class="grid-two">
+    <div class="card" id="geminiCard">
+      <h2>Gemini 云端识别 <small>可选 · Google</small></h2>
+      <div class="privacy-note">
+        <b>隐私说明：</b>选择 Gemini 引擎时，<b>页面图像会上传到 Google 服务器</b>进行识别（使用 AI 总结时，所选文字也会发送给 Google）。免费层级的数据可能被 Google 用于改进产品，涉密、未公开或受限档案请使用 <b>Tesseract（本地）</b>——它完全在本机运行，文件不会离开电脑。
+      </div>
+      <label class="field">Gemini API Key <input id="gemKey" type="password" placeholder="AIza…" autocomplete="off" spellcheck="false"></label>
+      <p class="small muted">没有密钥？在 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">Google AI Studio 获取 API Key ↗</a>（https://aistudio.google.com/apikey，有免费额度）。密钥只保存在本浏览器的 localStorage，<b>不会写入备份或导出文件</b>。</p>
+      <div class="two">
+        <label class="field">模型 <select id="gemModel"></select></label>
+        <label class="field" id="gemCustomRow">自定义模型名称 <input id="gemCustom" placeholder="例如 gemini-2.5-flash-lite" spellcheck="false"></label>
+      </div>
+      <label class="field">并行请求数 <select id="gemConc"><option>1</option><option selected>2</option><option>3</option><option>4</option></select></label>
+      <div class="btnrow"><button id="gemSave" class="primary">保存</button><button id="gemTest" class="ghost">测试连接</button><button id="gemList" class="ghost" title="通过 ListModels 获取您的密钥可用的模型">获取可用模型</button><button id="gemClear" class="ghost">清除密钥</button></div>
+      <p id="gemStatus" class="muted small"></p>
+    </div>
     <div class="card">
       <h2>AI 总结（可选）</h2>
-      <p class="muted small">填写任一 OpenAI 兼容接口（如 OpenAI、DeepSeek、通义千问兼容模式、本地 Ollama / LM Studio）。密钥只保存在本浏览器的 localStorage，不写入档案备份。<b>注意：使用 AI 时，所选文字会发送到该接口。</b>不填写也可使用全部本地功能。</p>
-      <label class="field">接口地址 <input id="aiEndpoint" placeholder="https://api.openai.com/v1 或 http://localhost:11434/v1"></label>
-      <label class="field">API Key <input id="aiKey" type="password" placeholder="sk-…（本地模型可留空）" autocomplete="off"></label>
-      <label class="field">模型 <input id="aiModel" placeholder="gpt-4o-mini / deepseek-chat / qwen2.5"></label>
+      <label class="field">服务提供方
+        <select id="aiProvider"><option value="openai">OpenAI 兼容接口</option><option value="gemini">Google Gemini（使用上方 Gemini 密钥）</option></select>
+      </label>
+      <p class="muted small ai-openai">填写任一 OpenAI 兼容接口（如 OpenAI、DeepSeek、通义千问兼容模式、本地 Ollama / LM Studio）。密钥只保存在本浏览器的 localStorage，不写入档案备份。<b>注意：使用 AI 时，所选文字会发送到该接口。</b>不填写也可使用全部本地功能。</p>
+      <p class="muted small ai-gemini">使用与 OCR 相同的 Gemini 密钥生成条目摘要、主题总结与年表总结，只需一个密钥。<b>所选文字会发送给 Google。</b></p>
+      <label class="field ai-openai">接口地址 <input id="aiEndpoint" placeholder="https://api.openai.com/v1 或 http://localhost:11434/v1"></label>
+      <label class="field ai-openai">API Key <input id="aiKey" type="password" placeholder="sk-…（本地模型可留空）" autocomplete="off"></label>
+      <label class="field ai-openai">模型 <input id="aiModel" placeholder="gpt-4o-mini / deepseek-chat / qwen2.5"></label>
+      <label class="field ai-gemini">总结所用模型 <input id="aiGemModel" placeholder="留空则使用 Gemini 设置中的模型（如 gemini-2.5-flash）" spellcheck="false"></label>
       <div class="btnrow"><button id="aiSave" class="primary">保存</button><button id="aiTest" class="ghost">测试连接</button><button id="aiClear" class="ghost">清除</button></div>
       <p id="aiStatus" class="muted small"></p>
     </div>
+  </div>
+  <div class="grid-two">
     <div class="card">
       <h2>备份与恢复</h2>
       <p class="muted small">完整备份包含全部条目（含图像）、笔记、年表与 AI 总结，为单个 JSON 文件。</p>
@@ -195,7 +233,7 @@
       <p id="storageInfo" class="muted small"></p>
       <div class="btnrow"><button id="persistBtn" class="ghost">申请持久存储</button><button id="wipeBtn" class="danger">清空全部数据</button></div>
       <h2>关于</h2>
-      <p class="muted small">基于 Tesseract.js（LSTM 引擎）、pdf.js、mammoth.js、SheetJS、heic2any。所有档案数据保存在本浏览器的 IndexedDB 中；更换浏览器或清除站点数据前请先导出备份。</p>
+      <p class="muted small">基于 Tesseract.js（LSTM 引擎）、pdf.js、mammoth.js、SheetJS、heic2any；可选 Google Gemini API 云端识别。所有档案数据保存在本浏览器的 IndexedDB 中；更换浏览器或清除站点数据前请先导出备份。</p>
     </div>
   </div>
 </section>
