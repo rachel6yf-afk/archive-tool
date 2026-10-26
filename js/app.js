@@ -5,6 +5,7 @@ import { OcrPool, LANGS, cleanText, preprocess, canvasToBlob, lowConfidenceWords
 import { openVisual, extractDocument, isImageLike, isDocLike, titleFromName, ext } from './importers.js';
 import { download, safeName, exportBlocks, rowsToCsv, rowsToXlsx, blobToDataURL, dataURLToBlob } from './exporters.js';
 import { getAI, setAI, aiEnabled, chat } from './ai.js';
+import { getGemini, setGemini, geminiModel, geminiReady, ocrCanvas, testGemini, listModels, modelEvents, GEMINI_MODELS } from './gemini.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
@@ -46,9 +47,16 @@ async function saveItem(it, immediate = false) {
 async function saveMeta(key, value) { S.meta[key] = value; await db.put('meta', { key, value }); }
 
 // ---------- OCR settings ----------
-const OCR_DEFAULT = { langs: ['chi_sim', 'eng'], vertical: false, psm: 3, pool: Math.max(1, Math.min(2, Math.floor((navigator.hardwareConcurrency || 2) / 2))), gray: true, upscale: true, contrast: false, threshold: false, invert: false, scale: 2.5, pdfText: true };
-function getOcr() { try { return { ...OCR_DEFAULT, ...JSON.parse(localStorage.getItem('archive-ocr.ocr')) }; } catch { return { ...OCR_DEFAULT }; } }
-function setOcr(o) { localStorage.setItem('archive-ocr.ocr', JSON.stringify(o)); }
+const OCR_DEFAULT = { langs: ['chi_sim', 'eng'], vertical: false, psm: 3, pool: Math.max(1, Math.min(2, Math.floor((navigator.hardwareConcurrency || 2) / 2))), gray: true, upscale: true, contrast: false, threshold: false, invert: false, scale: 2.5, pdfText: true, engineChoice: 'auto', fallback: true };
+// Engine: an explicit user choice ('tesseract' | 'gemini') persists and wins; otherwise ('auto') Gemini is the default
+// whenever a Gemini key is saved, and Tesseract (fully local) when there is no key.
+function getOcr() {
+  let o; try { o = { ...OCR_DEFAULT, ...JSON.parse(localStorage.getItem('archive-ocr.ocr')) }; } catch { o = { ...OCR_DEFAULT }; }
+  if (o.engine && !o.engineChoice) o.engineChoice = o.engine; // settings saved by an earlier version
+  o.engine = o.engineChoice === 'gemini' || o.engineChoice === 'tesseract' ? o.engineChoice : (geminiReady() ? 'gemini' : 'tesseract');
+  return o;
+}
+function setOcr(o) { const { engine, ...rest } = o; localStorage.setItem('archive-ocr.ocr', JSON.stringify(rest)); }
 function effectiveLangs(o) {
   let langs = o.langs.length ? [...o.langs] : ['chi_sim'];
   // Vertical mode: use only the vertical Chinese models (Latin models confuse vertical column segmentation).
@@ -61,19 +69,41 @@ function initOcrSettings() {
   $('#optVertical').checked = o.vertical; $('#optPsm').value = String(o.psm); $('#optPool').value = String(o.pool);
   for (const k of ['gray', 'upscale', 'contrast', 'threshold', 'invert']) $('#opt' + k[0].toUpperCase() + k.slice(1)).checked = o[k];
   $('#optScale').value = String(o.scale); $('#optPdfText').checked = o.pdfText;
-  const read = () => {
+  $('#optFallback').checked = o.fallback;
+  const read = (e) => {
+    const prev = getOcr();
     const n = {
       langs: $$('#langChips input:checked').map((i) => i.value), vertical: $('#optVertical').checked, psm: +$('#optPsm').value, pool: +$('#optPool').value,
       gray: $('#optGray').checked, upscale: $('#optUpscale').checked, contrast: $('#optContrast').checked, threshold: $('#optThreshold').checked, invert: $('#optInvert').checked,
       scale: +$('#optScale').value, pdfText: $('#optPdfText').checked,
+      engineChoice: e?.target?.name === 'engine' ? e.target.value : prev.engineChoice, fallback: $('#optFallback').checked,
     };
-    setOcr(n);
+    setOcr(n); applyEngineUI();
   };
   $('#view-import .settings-card').addEventListener('change', (e) => {
     if (e.target.id === 'optVertical') $('#optPsm').value = e.target.checked ? '5' : '3';
-    read();
+    read(e);
   });
+  applyEngineUI();
 }
+function applyEngineUI() {
+  const o = getOcr(), gem = o.engine === 'gemini';
+  $(gem ? '#engGem' : '#engTess').checked = true;
+  document.body.classList.toggle('engine-gemini', gem);
+  const note = $('#engNote'); note.hidden = !gem && geminiReady();
+  if (!gem) note.innerHTML = o.engineChoice === 'auto'
+    ? '提示：在 <a href="#/settings">设置 → Gemini</a> 中添加 Gemini API Key 后，新导入的材料将默认使用更准确的 Gemini 云端识别（页面图像会发送至 Google）。不添加则始终在本机用 Tesseract 识别。'
+    : '已选择 Tesseract 本地识别：文件不会离开本机。';
+  else note.innerHTML = geminiReady()
+    ? `将使用 <b>${esc(geminiModel())}</b> 识别。<b>页面图像会发送至 Google</b>；同时最多 ${getGemini().concurrency} 个请求。<a href="#/settings">Gemini 设置 ›</a>`
+    : `<span class="warn">尚未设置 Gemini API Key。</span> 请先到 <a href="#/settings">设置 → Gemini</a> 填写密钥${o.fallback ? '；在此之前将自动改用 Tesseract。' : '。'}`;
+  $('#privacyText').textContent = gem ? 'Gemini 云端识别已开启' : '仅在本机处理';
+  $('#privacy').classList.toggle('cloud', gem);
+  $('#privacy').title = gem ? '当前识别引擎为 Gemini：页面图像会发送至 Google 服务器识别。档案库、笔记等数据仍只保存在本机。' : '所有处理均在本机浏览器内完成，文件不会上传';
+}
+const langNamesFor = (cfg) => { const m = new Map(LANGS); return (cfg.langs.length ? cfg.langs : ['chi_sim']).map((l) => m.get(l) || l); };
+const runnersFor = (cfg, engine = cfg.engine) => engine === 'gemini' ? Math.max(cfg.pool, +getGemini().concurrency || 2) : cfg.pool;
+function ocrInfo(cfg, engine = cfg.engine) { return { engine, model: engine === 'gemini' ? geminiModel() : 'tesseract', langs: effectiveLangs(cfg), psm: cfg.psm }; }
 
 // ---------- processing queue ----------
 const pool = new OcrPool();
@@ -83,6 +113,7 @@ function configurePool(cfg) { poolLock = poolLock.then(() => pool.configure({ la
 
 function queueRow(it, file) {
   if ($('#queueList .empty')) $('#queueList').innerHTML = '';
+  Q.rows.get(it.id)?.remove();
   const li = document.createElement('li');
   li.dataset.id = it.id;
   li.innerHTML = `<span class="qname">${esc(file.name)}</span><span class="qstatus muted small">排队中</span><div class="bar"><span></span></div><a class="small" href="#/item/${it.id}">查看</a>`;
@@ -96,7 +127,11 @@ function updateRow(it) {
   $('.bar span', li).style.width = Math.round((it.status === 'done' ? 1 : prog) * 100) + '%';
   const doneN = pages.filter((p) => p.status === 'done').length;
   const c = itemConf(it);
-  $('.qstatus', li).innerHTML = it.status === 'error' ? `<span class="err">失败：${esc(it.error || '')}</span>` : it.status === 'done' ? `完成 · ${pages.length} 页` + (c != null ? ` · 置信度 <b class="conf ${confClass(c)}">${c}%</b>` : '') : pages.length ? `识别中 ${doneN}/${pages.length} 页` : '准备中…';
+  const errs = pages.filter((p) => p.status === 'error' || p.lastError), fb = pages.filter((p) => p.fallbackFrom).length;
+  const gem = pages.some((p) => p.engine === 'gemini');
+  const live = pages.find((p) => p.statusText)?.statusText;
+  const extra = (gem ? ' · <span class="conf gem">引擎：Gemini</span>' : '') + (fb ? ` · <span class="warn" title="${esc(pages.find((p) => p.fallbackFrom).engineError || '')}">${fb} 页已改用 Tesseract</span>` : '') + (errs.length && it.status !== 'error' ? ` · <span class="err">${errs.length} 页失败：${esc(errs[0].error || errs[0].lastError || '')}</span>` : '');
+  $('.qstatus', li).innerHTML = it.status === 'error' ? `<span class="err">失败：${esc(it.error || '')}</span>` : it.status === 'done' ? `完成 · ${pages.length} 页` + (c != null ? ` · 置信度 <b class="conf ${confClass(c)}">${c}%</b>` : '') + extra : pages.length ? `识别中 ${doneN}/${pages.length} 页` + (live ? ` · <span class="muted">${esc(live)}</span>` : '') : '准备中…';
   li.className = it.status;
 }
 function updateGlobal() {
@@ -112,9 +147,10 @@ async function importVisualFiles(files) {
   const tags = parseTags($('#batchTags').value);
   files = files.filter(isImageLike);
   if (!files.length) return;
-  toast(`已加入 ${files.length} 个文件，开始识别…`);
+  if (cfg.engine === 'gemini' && !geminiReady()) toast(cfg.fallback ? '尚未设置 Gemini API Key，本批次将改用 Tesseract 本地识别。' : '尚未设置 Gemini API Key，请先到“设置”填写，否则识别会失败。', 5000);
+  else toast(`已加入 ${files.length} 个文件，开始${cfg.engine === 'gemini' ? '由 Gemini ' : ''}识别…`);
   for (const file of files) {
-    const it = { id: db.uid('it-'), title: titleFromName(file.name), sourceName: file.webkitRelativePath || file.name, type: OCR_TYPES.includes(ext(file.name)) ? ext(file.name) : (ext(file.name) === 'pdf' ? 'pdf' : 'image'), size: file.size, createdAt: Date.now(), status: 'processing', pages: [], tags: [...tags], dates: '', notes: '', ocr: { langs: effectiveLangs(cfg), psm: cfg.psm } };
+    const it = { id: db.uid('it-'), title: titleFromName(file.name), sourceName: file.webkitRelativePath || file.name, type: OCR_TYPES.includes(ext(file.name)) ? ext(file.name) : (ext(file.name) === 'pdf' ? 'pdf' : 'image'), size: file.size, createdAt: Date.now(), status: 'processing', pages: [], tags: [...tags], dates: '', notes: '', ocr: ocrInfo(cfg) };
     if (['jpg', 'jpeg', 'png', 'webp', 'bmp', 'gif', 'jfif'].includes(ext(file.name))) it.type = 'image';
     if (['tif', 'tiff'].includes(ext(file.name))) it.type = 'tiff';
     if (['heic', 'heif'].includes(ext(file.name))) it.type = 'heic';
@@ -122,7 +158,7 @@ async function importVisualFiles(files) {
     queueRow(it, file);
     Q.tasks.push({ kind: 'open', it, file, cfg });
   }
-  pumpQueue(cfg.pool);
+  pumpQueue(runnersFor(cfg));
   rerenderCurrent();
 }
 function pumpQueue(n) { while (Q.running < n && Q.tasks.length) { Q.running++; runner().finally(() => { Q.running--; if (Q.tasks.length) pumpQueue(n); else if (!Q.running) onQueueIdle(); }); } }
@@ -139,46 +175,109 @@ async function runner() {
         Q.tasks.unshift(...src.pages.map((p, i) => ({ kind: 'page', it: t.it, idx: i, src: p, cfg: t.cfg, pending })));
         updateRow(t.it); await saveItem(t.it, true);
       } else if (t.kind === 'page') {
-        await processPage(t.it, t.idx, t.src, t.cfg);
+        await processPage(t.it, t.idx, t.src, t.cfg, t.engine || t.cfg.engine);
         Q.done++; updateGlobal();
         if (--t.pending.n === 0) { t.pending.cleanup?.(); await finishItem(t.it); }
       }
     } catch (e) {
       console.error(e);
       const it = t.it;
-      if (t.kind === 'page') { it.pages[t.idx].status = 'error'; it.pages[t.idx].error = String(e.message || e); Q.done++; updateGlobal(); if (--t.pending.n === 0) await finishItem(it); }
+      if (t.kind === 'page') {
+        const pg = it.pages[t.idx], msg = String(e.message || e);
+        pg.statusText = ''; pg.progress = 0;
+        if (t.src?.reuse && pg.text) { pg.status = 'done'; pg.lastError = msg; } else { pg.status = 'error'; pg.error = msg; }
+        notifyError(msg);
+        Q.done++; updateGlobal(); await saveItem(it, true); refreshItemViewIf(it, t.idx); if (--t.pending.n === 0) await finishItem(it);
+      }
       else { it.status = 'error'; it.error = String(e.message || e); await saveItem(it, true); }
       updateRow(it);
     }
   }
 }
-async function processPage(it, idx, src, cfg) {
+let lastErrToast = 0;
+function notifyError(msg) { if (Date.now() - lastErrToast > 4000) { lastErrToast = Date.now(); toast('识别失败：' + esc(msg), 6000); } }
+async function tesseractPage(canvas, cfg, onProg) {
+  await configurePool(cfg);
+  const pre = preprocess(canvas, cfg);
+  const data = await pool.recognize(pre, onProg);
+  return { text: cleanText(data.text), confidence: Math.round(data.confidence), source: 'ocr', engine: 'tesseract', model: 'tesseract.js ' + effectiveLangs(cfg).join('+'), low: lowConfidenceWords(data, pre.width, pre.height) };
+}
+async function geminiPage(canvas, cfg, page, it, idx) {
+  page.progress = 0.04;
+  // Gemini reports no progress: advance the bar asymptotically while waiting for the response.
+  const tick = setInterval(() => { page.progress = Math.min(0.92, page.progress + (0.92 - page.progress) * 0.05); updateRow(it); refreshProgressIf(it, idx); }, 400);
+  try {
+    const r = await ocrCanvas(canvas, { langNames: langNamesFor(cfg), vertical: cfg.vertical, onStatus: (st) => { page.statusText = st; updateRow(it); refreshProgressIf(it, idx); } });
+    return { text: r.text, confidence: null, source: 'ocr', engine: 'gemini', model: r.model, low: [], warning: r.truncated ? 'Gemini 输出达到长度上限，本页文字可能不完整' : '' };
+  } finally { clearInterval(tick); page.statusText = ''; }
+}
+async function recognizePage(canvas, cfg, engine, page, it, idx) {
+  const prog = (p) => { page.progress = p; updateRow(it); refreshProgressIf(it, idx); };
+  if (engine !== 'gemini') return tesseractPage(canvas, cfg, prog);
+  try { return await geminiPage(canvas, cfg, page, it, idx); }
+  catch (e) {
+    if (!cfg.fallback || e.name === 'AbortError') throw e;
+    console.warn('Gemini failed, falling back to Tesseract:', e.message);
+    page.statusText = 'Gemini 失败，改用 Tesseract…'; page.progress = 0; updateRow(it);
+    const r = await tesseractPage(canvas, cfg, prog);
+    page.statusText = '';
+    return { ...r, fallbackFrom: 'gemini', engineError: String(e.message || e) };
+  }
+}
+async function processPage(it, idx, src, cfg, engine = cfg.engine) {
   const page = it.pages[idx];
   page.status = 'rendering'; updateRow(it); refreshItemViewIf(it, idx);
   const { canvas, text } = await src.render();
-  page.image = await canvasToBlob(canvas, 2200);
-  page.w = canvas.width; page.h = canvas.height;
-  if (idx === 0) it.thumb = await canvasToBlob(canvas, 360, 'image/jpeg', 0.8);
+  if (!src.reuse) {
+    page.image = await canvasToBlob(canvas, 2200);
+    page.w = canvas.width; page.h = canvas.height;
+    if (idx === 0) it.thumb = await canvasToBlob(canvas, 360, 'image/jpeg', 0.8);
+  }
   if (text) {
-    Object.assign(page, { text: cleanText(text), confidence: null, source: 'pdf-text', status: 'done', progress: 1, low: [] });
+    Object.assign(page, { text: cleanText(text), confidence: null, source: 'pdf-text', engine: 'pdf-text', model: '', status: 'done', progress: 1, low: [] });
   } else {
-    page.status = 'ocr';
-    await configurePool(cfg);
-    const pre = preprocess(canvas, cfg);
-    const data = await pool.recognize(pre, (p) => { page.progress = p; updateRow(it); refreshProgressIf(it, idx); });
-    Object.assign(page, { text: cleanText(data.text), confidence: Math.round(data.confidence), source: 'ocr', status: 'done', progress: 1, low: lowConfidenceWords(data, pre.width, pre.height) });
+    page.status = 'ocr'; page.engine = engine; refreshItemViewIf(it, idx);
+    const r = await recognizePage(canvas, cfg, engine, page, it, idx);
+    Object.assign(page, { fallbackFrom: null, engineError: '', warning: '', lastError: '', error: '', edited: false, statusText: '' }, r, { status: 'done', progress: 1, at: Date.now() });
   }
   await saveItem(it, true);
   updateRow(it); refreshItemViewIf(it, idx);
 }
+// Re-OCR existing pages (from the stored page images) through the same queue / progress UI.
+function canvasFromBlob(blob) { return createImageBitmap(blob).then((b) => { const cv = document.createElement('canvas'); cv.width = b.width; cv.height = b.height; cv.getContext('2d').drawImage(b, 0, 0); b.close?.(); return cv; }); }
+function enqueueReocr(it, idxs, engine, cfg) {
+  idxs = idxs.filter((i) => it.pages[i]?.image);
+  if (!idxs.length) return 0;
+  it.status = 'processing'; it.error = ''; it.ocr = ocrInfo(cfg, engine);
+  queueRow(it, { name: it.sourceName || it.title });
+  const pending = { n: idxs.length };
+  for (const i of idxs) Object.assign(it.pages[i], { status: 'queued', progress: 0, statusText: '' });
+  Q.total += idxs.length; updateGlobal(); updateRow(it);
+  Q.tasks.push(...idxs.map((i) => ({ kind: 'page', it, idx: i, cfg, engine, pending, src: { reuse: true, render: async () => ({ canvas: await canvasFromBlob(it.pages[i].image), text: '' }) } })));
+  return idxs.length;
+}
+function reocr(list, engine) {
+  const cfg = getOcr();
+  if (engine === 'gemini' && !geminiReady() && !cfg.fallback) { toast('请先在“设置 → Gemini”中填写 API Key', 4000); location.hash = '#/settings'; return 0; }
+  const targets = list.filter((x) => OCR_TYPES.includes(x.it.type) && x.it.status !== 'processing');
+  const edited = targets.reduce((n, x) => n + x.idxs.filter((i) => x.it.pages[i]?.edited).length, 0);
+  if (edited && !confirm(`其中 ${edited} 页的文字已手动编辑，重新识别将覆盖这些修改。继续吗？`)) return 0;
+  let n = 0; for (const x of targets) n += enqueueReocr(x.it, x.idxs, engine, cfg);
+  if (!n) { toast('没有可重新识别的图像页'); return 0; }
+  toast(`已加入 ${n} 页，正在用 ${engine === 'gemini' ? 'Gemini' : 'Tesseract'} 重新识别…`);
+  pumpQueue(runnersFor(cfg, engine));
+  return n;
+}
 async function finishItem(it) {
   it.status = it.pages.every((p) => p.status === 'error') ? 'error' : 'done';
+  it.warning = it.pages.some((p) => p.warning) ? it.pages.find((p) => p.warning).warning : (it.warning || '').replace(/Gemini 输出达到长度上限[^。]*/, '');
   if (it.status === 'error') it.error = it.pages[0]?.error || '识别失败';
   await saveItem(it, true);
   await refreshTimelineFor(it);
   S.themes = null;
   updateRow(it);
   if (location.hash.startsWith('#/library')) renderLibrary();
+  refreshItemViewIf(it, S.page[it.id] ?? 0);
 }
 function onQueueIdle() { if (Q.total && Q.done >= Q.total) { toast('全部识别完成 ✓'); Q.total = Q.done = 0; updateGlobal(); } }
 
@@ -362,16 +461,17 @@ function libraryItems() {
 }
 function renderLibraryCards(items) {
   const box = $('#libItems');
-  box.className = 'lib ' + S.libMode;
+  box.className = 'lib ' + S.libMode + (S.selecting ? ' selecting' : '');
   if (!items.length) { box.innerHTML = `<div class="empty-big"><p class="big">❧</p><p>${S.items.size ? '没有符合条件的条目。' : '档案库还是空的。'}</p><p><a class="button primary" href="#/import">导入图像、PDF 或文档</a></p></div>`; return; }
   box.innerHTML = items.map((it) => {
     const keys = itemDateKeys(it); const c = itemConf(it); const txt = itemText(it);
     const thumb = it.thumb ? `<img src="${blobUrl(it.thumb)}" alt="" loading="lazy">` : `<div class="docicon ${it.type}">${TYPE_LABEL[it.type] || it.type}</div>`;
-    return `<a class="lib-card ${it.status}" href="#/item/${it.id}">
-      <div class="thumb">${thumb}${it.status === 'processing' ? '<span class="badge busy">识别中…</span>' : it.status === 'error' ? '<span class="badge err">失败</span>' : ''}</div>
+    const gem = (it.pages || []).some((p) => p.engine === 'gemini');
+    return `<a class="lib-card ${it.status} ${S.libSel?.has(it.id) ? 'picked' : ''}" href="#/item/${it.id}" data-id="${it.id}">
+      <div class="thumb">${S.selecting ? `<span class="pick" aria-hidden="true">${S.libSel.has(it.id) ? '✓' : ''}</span>` : ''}${thumb}${it.status === 'processing' ? '<span class="badge busy">识别中…</span>' : it.status === 'error' ? '<span class="badge err">失败</span>' : ''}</div>
       <div class="lib-body">
         <h3>${esc(it.title)}</h3>
-        <p class="meta small"><span class="type">${TYPE_LABEL[it.type] || it.type}</span>${it.pages?.length > 1 ? ` · ${it.pages.length} 页` : ''}${keys.length ? ` · ${esc(displayKey(keys[0]))}${keys.length > 1 ? ' 起' : ''}` : ''}${c != null ? ` · <span class="conf ${confClass(c)}">${c}%</span>` : ''}</p>
+        <p class="meta small"><span class="type">${TYPE_LABEL[it.type] || it.type}</span>${it.pages?.length > 1 ? ` · ${it.pages.length} 页` : ''}${keys.length ? ` · ${esc(displayKey(keys[0]))}${keys.length > 1 ? ' 起' : ''}` : ''}${c != null ? ` · <span class="conf ${confClass(c)}">${c}%</span>` : ''}${gem ? ' · <span class="conf gem">Gemini</span>' : ''}</p>
         <p class="excerpt small">${esc(txt.slice(0, 120).replace(/\s+/g, ' '))}${txt.length > 120 ? '…' : ''}</p>
         <p class="tags">${(it.tags || []).map((t) => `<span class="tag">${esc(t)}</span>`).join('')}</p>
       </div></a>`;
@@ -384,7 +484,7 @@ async function exportLibrary(fmt) {
   const header = (it) => `===== ${it.title}（${it.sourceName}）=====`;
   const pageText = (it) => it.pages.length > 1 ? it.pages.map((p, i) => `--- 第 ${i + 1} 页 ---\n${p.text || ''}`).join('\n\n') : itemText(it);
   if (fmt === 'txt') return download(`档案文字_${stamp}.txt`, items.map((it) => header(it) + '\n' + pageText(it)).join('\n\n\n'));
-  const json = items.flatMap((it) => it.pages.map((p, i) => ({ filename: it.sourceName, title: it.title, page: i + 1, text: p.text || '', confidence: p.confidence ?? null, source: p.source || '', languages: it.ocr?.langs || null, tags: it.tags || [], edited: !!p.edited })));
+  const json = items.flatMap((it) => it.pages.map((p, i) => ({ filename: it.sourceName, title: it.title, page: i + 1, text: p.text || '', confidence: p.confidence ?? null, source: p.source || '', engine: p.engine || (p.source === 'ocr' ? 'tesseract' : p.source || ''), model: p.model || '', languages: it.ocr?.langs || null, tags: it.tags || [], edited: !!p.edited })));
   if (fmt === 'json') return download(`档案文字_${stamp}.json`, JSON.stringify(json, null, 2), 'application/json');
   if (fmt === 'docx') { const b = [{ t: 'h1', text: '档案文字汇编' }, { t: 'meta', text: `${items.length} 个条目 · 导出于 ${fmtTime(Date.now())}` }]; for (const it of items) { b.push({ t: 'h2', text: it.title }, { t: 'meta', text: it.sourceName }); it.pages.forEach((p, i) => { if (it.pages.length > 1) b.push({ t: 'h3', text: `第 ${i + 1} 页` }); b.push({ t: 'p', text: p.text || '' }); }); } return exportBlocks(b, `档案文字_${stamp}`, 'docx'); }
   const zip = new JSZip(); const used = new Set();
@@ -395,6 +495,25 @@ async function exportLibrary(fmt) {
 function initLibrary() {
   $('#libExport').addEventListener('click', (e) => { const f = e.target.dataset.lexp; if (f) exportLibrary(f); });
   ['#libFilter', '#libType', '#libTag', '#libSort'].forEach((s) => $(s).addEventListener('input', () => debounce('lib', renderLibrary, 150)));
+  S.libSel = new Set();
+  const selUI = () => { $('#libSelBar').hidden = !S.selecting; $('#libSelN').textContent = S.libSel.size; $('#libSelect').classList.toggle('on', !!S.selecting); };
+  $('#libSelect').addEventListener('click', () => { S.selecting = !S.selecting; if (!S.selecting) S.libSel.clear(); selUI(); renderLibrary(); });
+  $('#libSelDone').addEventListener('click', () => { S.selecting = false; S.libSel.clear(); selUI(); renderLibrary(); });
+  $('#libSelAll').addEventListener('click', () => { for (const it of libraryItems()) if (OCR_TYPES.includes(it.type)) S.libSel.add(it.id); selUI(); renderLibrary(); });
+  $('#libSelNone').addEventListener('click', () => { S.libSel.clear(); selUI(); renderLibrary(); });
+  $('#libItems').addEventListener('click', (e) => {
+    if (!S.selecting) return; const a = e.target.closest('.lib-card'); if (!a) return;
+    e.preventDefault(); const id = a.dataset.id; S.libSel.has(id) ? S.libSel.delete(id) : S.libSel.add(id); selUI(); renderLibrary();
+  });
+  const go = (engine) => {
+    const list = [...S.libSel].map((id) => S.items.get(id)).filter(Boolean);
+    if (!list.length) return toast('请先点击卡片选择条目');
+    const skipped = list.filter((it) => !OCR_TYPES.includes(it.type)).length;
+    const n = reocr(list.map((it) => ({ it, idxs: (it.pages || []).map((_, i) => i) })), engine);
+    if (n) { if (skipped) toast(`已加入 ${n} 页重新识别；跳过 ${skipped} 个文档类条目`, 4000); S.selecting = false; S.libSel.clear(); selUI(); renderLibrary(); }
+  };
+  $('#libReGem').addEventListener('click', () => go('gemini'));
+  $('#libReTess').addEventListener('click', () => go('tesseract'));
   $$('#view-library .seg button').forEach((b) => b.addEventListener('click', () => { S.libMode = b.dataset.mode; $$('#view-library .seg button').forEach((x) => x.classList.toggle('on', x === b)); renderLibrary(); }));
 }
 
@@ -415,10 +534,11 @@ function renderItem(id, pageNo) {
     <input class="title-input" id="itTitle" value="${esc(it.title)}" aria-label="标题">
     <div class="btnrow wrap">
       ${aiEnabled() ? '<button id="itAI" class="ghost">AI 摘要</button>' : ''}
+      ${visual && it.pages.length > 1 ? '<button id="itReGem" class="ghost" title="将本条目的全部页面发送至 Gemini 重新识别">全部页用 Gemini 识别</button>' : ''}
       <button id="itCopy" class="ghost">复制全文</button><button id="itTxt" class="ghost">下载 .txt</button><button id="itDel" class="danger">删除</button>
     </div>
   </div>
-  <p class="muted small">来源文件：${esc(it.sourceName)} · ${TYPE_LABEL[it.type] || it.type} · 导入于 ${fmtTime(it.createdAt)}${it.ocr ? ` · 识别语言 ${esc(it.ocr.langs.join('+'))}` : ''}${it.warning ? ` · <span class="warn">${esc(it.warning)}</span>` : ''}${it.status === 'error' ? ` · <span class="err">${esc(it.error || '')}</span>` : ''}</p>
+  <p class="muted small">来源文件：${esc(it.sourceName)} · ${TYPE_LABEL[it.type] || it.type} · 导入于 ${fmtTime(it.createdAt)}${it.ocr ? (it.ocr.engine === 'gemini' ? ` · 识别引擎 Gemini（${esc(it.ocr.model || '')}）` : ` · 识别语言 ${esc(it.ocr.langs.join('+'))}`) : ''}${it.warning ? ` · <span class="warn">${esc(it.warning)}</span>` : ''}${it.status === 'error' ? ` · <span class="err">${esc(it.error || '')}</span>` : ''}</p>
   <div class="meta-grid">
     <label class="field">档案日期 <input id="itDates" value="${esc(it.dates || '')}" placeholder="如 1937-07-07；民国二十六年；1937—1938"></label>
     <label class="field">标签 / 主题 <input id="itTags" value="${esc((it.tags || []).join(', '))}" placeholder="逗号分隔"></label>
@@ -428,15 +548,16 @@ function renderItem(id, pageNo) {
     ${visual ? `<figure class="pane image-pane">
       <div class="pane-bar"><span>原件图像 ${it.pages.length > 1 ? `· 第 ${p + 1} / ${it.pages.length} 页` : ''}</span>
         <span class="pane-tools">${it.pages.length > 1 ? `<button class="ghost small" id="pgPrev" ${p === 0 ? 'disabled' : ''}>‹ 上一页</button><button class="ghost small" id="pgNext" ${p >= it.pages.length - 1 ? 'disabled' : ''}>下一页 ›</button>` : ''}
-        <label class="toggle small"><input type="checkbox" id="showLow" ${S.showLow !== false ? 'checked' : ''}> 标出低置信词</label></span></div>
+        ${page.engine === 'gemini' ? '' : `<label class="toggle small"><input type="checkbox" id="showLow" ${S.showLow !== false ? 'checked' : ''}> 标出低置信词</label>`}</span></div>
       <div class="imgwrap">${page.image ? `<img id="pageImg" src="${blobUrl(page.image)}" alt="第${p + 1}页">` : `<div class="placeholder">${page.status === 'error' ? '读取失败' : '正在准备图像…'}</div>`}<div class="overlay" id="overlay"></div></div>
     </figure>` : `<aside class="pane docinfo"><div class="docicon big ${it.type}">${TYPE_LABEL[it.type] || it.type}</div><p class="small muted">文字由文档直接提取，可在右侧编辑。</p></aside>`}
     <div class="pane text-pane">
       <div class="pane-bar"><span>${visual ? '识别文字（可编辑）' : '文档文字（可编辑）'} <small class="muted" id="editedFlag">${page.edited ? '· 已编辑' : ''}</small></span>
-        <span>${page.source === 'pdf-text' ? '<span class="conf na">PDF 文字层</span>' : visual ? `<span class="conf ${confClass(page.confidence)}" title="Tesseract 平均置信度">置信度 ${page.confidence ?? '—'}${page.confidence != null ? '%' : ''}</span>` : ''}</span></div>
-      ${visual && page.status !== 'done' && page.status !== 'error' ? `<div class="progress"><div class="bar"><span style="width:${Math.round((page.progress || 0) * 100)}%"></span></div><small id="pageStatus">${{ queued: '排队中', rendering: '渲染页面…', ocr: '识别中…' }[page.status] || ''}</small></div>` : ''}
+        <span>${visual ? engineBadge(page) : ''}</span></div>
+      ${visual ? pageNotice(page) : ''}
+      ${visual && page.status !== 'done' && page.status !== 'error' ? `<div class="progress"><div class="bar"><span style="width:${Math.round((page.progress || 0) * 100)}%"></span></div><small id="pageStatus">${esc(page.statusText || ({ queued: '排队中', rendering: '渲染页面…', ocr: page.engine === 'gemini' ? '正在由 Gemini 识别…' : '识别中…' }[page.status] || ''))}</small></div>` : ''}
       <textarea id="itText" spellcheck="false" placeholder="${visual ? '识别结果将显示在这里' : ''}">${esc(page.text || '')}</textarea>
-      <div class="btnrow wrap small-note"><span class="muted small">提示：选中文字后可“引用到笔记”。检索时繁简体通查。</span><span class="btnrow" style="margin:0"><button id="pgT2S" class="ghost small" title="将本页文字中的繁体字转换为简体">繁→简</button>${visual ? '<button id="pgRerun" class="ghost small">用当前设置重新识别本页</button>' : ''}</span></div>
+      <div class="btnrow wrap small-note"><span class="muted small">提示：选中文字后可“引用到笔记”。检索时繁简体通查。</span><span class="btnrow" style="margin:0"><button id="pgT2S" class="ghost small" title="将本页文字中的繁体字转换为简体">繁→简</button>${visual ? '<button id="pgReTess" class="ghost small" title="使用当前 Tesseract 设置在本机重新识别">Tesseract 重识别本页</button><button id="pgReGem" class="ghost small gem-btn" title="将本页图像发送至 Google Gemini 识别">Gemini 重识别本页</button>' : ''}</span></div>
     </div>
   </div>
   <div class="grid-two lower">
@@ -470,7 +591,9 @@ function renderItem(id, pageNo) {
     for (const e of [...S.timeline.values()]) if (e.itemId === id) { S.timeline.delete(e.id); await db.del('timeline', e.id); }
     S.themes = null; toast('已删除'); location.hash = '#/library';
   });
-  $('#pgRerun')?.addEventListener('click', () => rerunPage(it, p));
+  $('#pgReTess')?.addEventListener('click', () => reocr([{ it, idxs: [p] }], 'tesseract'));
+  $('#pgReGem')?.addEventListener('click', () => reocr([{ it, idxs: [p] }], 'gemini'));
+  $('#itReGem')?.addEventListener('click', () => reocr([{ it, idxs: it.pages.map((_, i) => i) }], 'gemini'));
   $('#pgT2S').addEventListener('click', () => { page.text = toSimplified(ta.value); page.edited = true; ta.value = page.text; saveItem(it); refreshTimelineFor(it); S.themes = null; toast('已转换为简体'); });
   $('#itAI')?.addEventListener('click', async () => {
     const box = $('#itAIBox'); box.innerHTML = '<p class="muted">AI 正在生成摘要…</p>';
@@ -491,20 +614,20 @@ function refreshProgressIf(it, idx) {
   const bar = $('#view-item .progress .bar span'); if (bar) bar.style.width = Math.round((it.pages[idx].progress || 0) * 100) + '%';
   const st = $('#pageStatus'); if (st) st.textContent = `识别中… ${Math.round((it.pages[idx].progress || 0) * 100)}%`;
 }
-async function rerunPage(it, p) {
-  if (!it.pages[p]?.image) return toast('此页没有图像');
-  const cfg = getOcr();
-  const page = it.pages[p];
-  page.status = 'ocr'; page.progress = 0; renderItem(it.id, p);
-  try {
-    await configurePool(cfg);
-    const c = await (async () => { const b = await createImageBitmap(page.image); const cv = document.createElement('canvas'); cv.width = b.width; cv.height = b.height; cv.getContext('2d').drawImage(b, 0, 0); return cv; })();
-    const pre = preprocess(c, cfg);
-    const data = await pool.recognize(pre, (x) => { page.progress = x; refreshProgressIf(it, p); });
-    Object.assign(page, { text: cleanText(data.text), confidence: Math.round(data.confidence), source: 'ocr', status: 'done', edited: false, low: lowConfidenceWords(data, pre.width, pre.height) });
-    it.ocr = { langs: effectiveLangs(cfg), psm: cfg.psm };
-    await saveItem(it, true); await refreshTimelineFor(it); S.themes = null; renderItem(it.id, p); toast('已重新识别');
-  } catch (e) { page.status = 'error'; toast('识别失败：' + esc(e.message)); renderItem(it.id, p); }
+function engineBadge(page) {
+  if (page.source === 'pdf-text') return '<span class="conf na">PDF 文字层</span>';
+  if (page.engine === 'gemini') return `<span class="conf gem" title="模型：${esc(page.model || '')}。Gemini 不提供置信度，请对照原图核校。">引擎：Gemini</span>`;
+  if (page.status !== 'done' && page.confidence == null) return '<span class="conf na">置信度 —</span>';
+  return `<span class="conf ${confClass(page.confidence)}" title="Tesseract 平均置信度">置信度 ${page.confidence ?? '—'}${page.confidence != null ? '%' : ''}</span>` + (page.fallbackFrom ? ' <span class="conf fair" title="Gemini 失败后自动改用 Tesseract">已回退</span>' : '');
+}
+function pageNotice(page) {
+  const out = [];
+  if (page.status === 'error' && page.error) out.push(`<span class="err">识别失败：${esc(page.error)}</span>`);
+  if (page.lastError) out.push(`<span class="err">最近一次重新识别失败：${esc(page.lastError)}（保留原有文字）</span>`);
+  if (page.fallbackFrom) out.push(`<span class="warn">Gemini 识别失败（${esc(page.engineError || '')}），本页已自动改用 Tesseract。</span>`);
+  if (page.warning) out.push(`<span class="warn">${esc(page.warning)}</span>`);
+  if (page.status === 'done' && page.engine && page.source === 'ocr') out.push(`<span class="muted">本页由 ${esc(page.engine === 'gemini' ? 'Gemini · ' + (page.model || '') : (page.model || 'Tesseract'))} 识别${page.at ? ' · ' + fmtTime(page.at) : ''}</span>`);
+  return out.length ? `<p class="page-notice small">${out.join('<br>')}</p>` : '';
 }
 
 // ---------- quote selection -> note ----------
@@ -742,14 +865,48 @@ async function restore(file) {
   S.themes = null;
   return (data.items || []).length;
 }
+function renderGeminiSettings() {
+  const g = getGemini();
+  $('#gemKey').value = g.key || '';
+  const preset = GEMINI_MODELS.filter(([v]) => v !== '__custom'), extra = (g.available || []).filter((n) => !preset.some(([v]) => v === n));
+  $('#gemModel').innerHTML = preset.map(([v, n]) => `<option value="${v}">${esc(n)}</option>`).join('')
+    + (extra.length ? `<optgroup label="您的密钥可用的其他模型">${extra.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}</optgroup>` : '')
+    + '<option value="__custom">其他模型（手动填写）</option>';
+  const known = [...preset.map(([v]) => v), ...extra];
+  $('#gemModel').value = known.includes(g.model) || g.model === '__custom' ? g.model : '__custom';
+  $('#gemCustom').value = g.model === '__custom' ? g.custom || '' : (known.includes(g.model) ? g.custom || '' : g.model);
+  $('#gemConc').value = String(g.concurrency || 2);
+  $('#gemCustomRow').hidden = $('#gemModel').value !== '__custom';
+}
+function aiProviderUI() { const gem = $('#aiProvider').value === 'gemini'; $$('.ai-openai').forEach((e) => (e.hidden = gem)); $$('.ai-gemini').forEach((e) => (e.hidden = !gem)); }
 async function renderSettings() {
-  const a = getAI(); $('#aiEndpoint').value = a.endpoint || ''; $('#aiKey').value = a.key || ''; $('#aiModel').value = a.model || '';
+  renderGeminiSettings();
+  const a = getAI(); $('#aiProvider').value = a.provider || 'openai'; $('#aiEndpoint').value = a.endpoint || ''; $('#aiKey').value = a.key || ''; $('#aiModel').value = a.model || ''; $('#aiGemModel').value = a.geminiModel || ''; aiProviderUI();
   if (navigator.storage?.estimate) { const e = await navigator.storage.estimate(); const persisted = await navigator.storage.persisted?.(); $('#storageInfo').textContent = `已用约 ${(e.usage / 1048576).toFixed(1)} MB / 可用配额约 ${(e.quota / 1073741824).toFixed(1)} GB · ${S.items.size} 个条目、${S.notes.size} 条笔记、${S.timeline.size} 条年表 · ${persisted ? '已启用持久存储' : '未启用持久存储（浏览器空间紧张时可能清理数据）'}`; }
 }
 function initSettings() {
-  $('#aiSave').addEventListener('click', () => { setAI({ endpoint: $('#aiEndpoint').value.trim(), key: $('#aiKey').value.trim(), model: $('#aiModel').value.trim() }); applyAIVisibility(); toast('已保存 AI 设置（仅存于本浏览器）'); });
+  const saveGem = () => setGemini({ key: $('#gemKey').value.trim(), model: $('#gemModel').value, custom: $('#gemCustom').value.trim(), concurrency: +$('#gemConc').value });
+  $('#gemModel').addEventListener('change', () => { $('#gemCustomRow').hidden = $('#gemModel').value !== '__custom'; });
+  $('#gemSave').addEventListener('click', () => { saveGem(); applyEngineUI(); applyAIVisibility(); $('#gemStatus').textContent = ''; toast(`已保存 Gemini 设置（模型 ${esc(geminiModel())}；密钥仅存于本浏览器）`); });
+  $('#gemList').addEventListener('click', async () => {
+    saveGem(); if (!geminiReady()) { $('#gemStatus').innerHTML = '<span class="err">请先填写 API Key。</span>'; return; }
+    $('#gemStatus').textContent = '正在获取可用模型…';
+    try { const names = await listModels(); setGemini({ available: names }); renderGeminiSettings(); $('#gemStatus').innerHTML = `<span class="good">✓</span> 您的密钥可使用 ${names.length} 个模型，已加入“模型”列表。`; }
+    catch (e) { $('#gemStatus').innerHTML = `<span class="err">✗ ${esc(e.message)}</span>`; }
+  });
+  modelEvents.addEventListener('switched', (e) => { toast(`Gemini 模型 ${esc(e.detail.from)} 已不可用，已自动改用 ${esc(e.detail.to)}`, 6000); applyEngineUI(); if (location.hash.startsWith('#/settings')) renderGeminiSettings(); });
+  $('#gemClear').addEventListener('click', () => { setGemini({ key: '' }); renderGeminiSettings(); applyEngineUI(); applyAIVisibility(); $('#gemStatus').textContent = ''; toast('已清除 Gemini 密钥'); });
+  $('#gemTest').addEventListener('click', async () => {
+    saveGem(); applyEngineUI(); applyAIVisibility();
+    if (!geminiReady()) { $('#gemStatus').innerHTML = '<span class="err">请先填写 API Key。</span>'; return; }
+    $('#gemStatus').textContent = `正在测试 ${geminiModel()}…`;
+    try { const r = await testGemini({ onStatus: (m) => { $('#gemStatus').textContent = `正在测试 ${geminiModel()}… ${m}`; } }); $('#gemStatus').innerHTML = `<span class="good">✓ 连接成功</span> · 模型 ${esc(r.model)} · 回复：${esc(r.text.slice(0, 40))}`; }
+    catch (e) { $('#gemStatus').innerHTML = `<span class="err">✗ ${esc(e.message)}</span>`; }
+  });
+  $('#aiProvider').addEventListener('change', aiProviderUI);
+  $('#aiSave').addEventListener('click', () => { setAI({ provider: $('#aiProvider').value, endpoint: $('#aiEndpoint').value.trim(), key: $('#aiKey').value.trim(), model: $('#aiModel').value.trim(), geminiModel: $('#aiGemModel').value.trim() }); applyAIVisibility(); toast(aiEnabled() ? '已保存 AI 设置（仅存于本浏览器）' : ($('#aiProvider').value === 'gemini' ? '已保存。请在上方填写 Gemini API Key 后才能使用 AI 总结。' : '已保存。')); });
   $('#aiClear').addEventListener('click', () => { localStorage.removeItem('archive-ocr.ai'); renderSettings(); applyAIVisibility(); toast('已清除'); });
-  $('#aiTest').addEventListener('click', async () => { $('#aiStatus').textContent = '测试中…'; try { const r = await chat('请只回复“连接成功”。'); $('#aiStatus').textContent = '✓ ' + r.slice(0, 80); } catch (e) { $('#aiStatus').textContent = '✗ ' + e.message; } });
+  $('#aiTest').addEventListener('click', async () => { $('#aiSave').click(); $('#aiStatus').textContent = '测试中…'; try { const r = await chat('请只回复“连接成功”。'); $('#aiStatus').textContent = '✓ ' + r.slice(0, 80); } catch (e) { $('#aiStatus').textContent = '✗ ' + e.message; } });
   $('#backupBtn').addEventListener('click', backup);
   $('#restoreBtn').addEventListener('click', () => $('#restoreIn').click());
   $('#restoreIn').addEventListener('change', async (e) => { const f = e.target.files[0]; e.target.value = ''; if (!f) return; try { const n = await restore(f); toast(`已导入备份：${n} 个条目`); renderSettings(); } catch (err) { toast('导入失败：' + esc(err.message), 5000); } });
